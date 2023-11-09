@@ -1,0 +1,341 @@
+---
+title: "DS2 Final Project"
+author: "Wanxin Qi, Lesi He, Ke Xu"
+output: pdf_document
+---
+
+```{r set_up, message = FALSE}
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(ggplot2)
+library(corrplot)
+library(vip)
+library(rpart.plot)
+library(ranger)
+library(GGally)
+library(pdp)
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+theme_set(theme_minimal() + theme(legend.position = "bottom"))
+options(
+  ggplot2.continuous.colour = "viridis",
+  ggplot2.continuous.fill = "viridis")
+scale_colour_discrete = scale_colour_viridis_d
+scale_fill_discrete = scale_fill_viridis_d
+```
+
+## Data
+
+```{r clean_data}
+bike = read.csv("./data/SeoulBikeData.csv", check.names = F)
+
+# Missing value in the dataset
+sum(is.na(bike))
+
+# All the 0 hourly rented bike count are non-functioning day
+bike %>%
+  janitor::clean_names() %>%
+  filter(rented_bike_count == 0) %>%
+  count(functioning_day)
+
+# tidy
+bike = bike %>%
+  janitor::clean_names() %>%
+  mutate(
+    date = dmy(date),
+    week = weekdays(date, abbreviate = TRUE),
+    week = factor(week, levels = c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")),
+    rent = as.numeric(rented_bike_count),
+    hour = as.numeric(hour),
+    temp = as.numeric(temperature_c),
+    hum = as.numeric(humidity_percent),
+    wind = as.numeric(wind_speed_m_s),
+    visibility = as.numeric(visibility_10m),
+    dew_temp = as.numeric(dew_point_temperature_c),
+    radiation = as.numeric(solar_radiation_mj_m2),
+    rain = as.numeric(rainfall_mm),
+    snow = as.numeric(snowfall_cm),
+    season = as.factor(seasons),
+    holiday = as.factor(ifelse(holiday == "No Holiday", "No", "Yes")),
+    func = as.factor(functioning_day)
+  ) %>%
+  select(rent, hour, temp, hum, wind, visibility, dew_temp, radiation, 
+         rain, snow, season, week, holiday, func)
+
+# Dataset of the research
+set.seed(2022)
+bike = bike[sample(nrow(bike), 1000),]
+
+# Partition
+set.seed(2)
+trainRows = createDataPartition(y = bike$rent, p = 0.8, list = FALSE)
+trainData = bike[trainRows,]
+testData = bike[-trainRows,]
+
+train_x = model.matrix(rent ~ ., bike)[trainRows, -1]
+train_y = bike$rent[trainRows]
+test_x = model.matrix(rent ~ ., bike)[-trainRows, -1]
+test_y = bike$rent[-trainRows]
+```
+
+## EDA
+
+```{r eda}
+# Summary of Data
+# knitr::kable(summary(bike), digits = 2)
+
+# Correlation and Sactter Plot
+cont = bike %>% select(-week, -holiday, -func, -season)
+ggpairs(cont, lower = list(continuous = wrap("points", alpha = 0.3, size = 0.1)))
+
+# Average Hourly Rental Bike Count Across Seasons
+bike %>%
+  mutate(hour = as.factor(hour)) %>%
+  group_by(season, hour) %>%
+  summarise(rent.avg = mean(rent)) %>%
+  mutate(hour = as.integer(hour)) %>%
+  ggplot(aes(x = hour, y = rent.avg)) +
+  geom_point(aes(color = season)) + 
+  geom_line(aes(color = season)) +
+  labs(
+    title = "Average Hourly Rented Bike Count Across Seasons",
+    x = "Hour",
+    y = "Average Hourly Rented Bike Count")
+
+# Average Hourly Rental Bike Count Across Weekdays
+bike %>%
+  mutate(hour = as.factor(hour)) %>%
+  group_by(week, hour) %>%
+  summarise(rent.avg = mean(rent)) %>%
+  mutate(hour = as.numeric(hour)) %>%
+  ggplot(aes(x = hour, y = rent.avg)) +
+  geom_point(aes(color = week)) + 
+  geom_line(aes(color = week), alpha = 0.5) +
+  labs(
+    title = "Average Hourly Rented Bike Count Across Weekdays",
+    x = "Hour",
+    y = "Average Hourly Rented Bike Count")
+
+# Hourly Rented Bike Count Across Holiday
+bike %>%
+  ggplot(aes(y = rent, color = holiday)) +
+  geom_boxplot() +
+  labs(
+    title = "Hourly Rented Bike Count Across Holiday",
+    y = "Hourly Rented Bike Count")
+
+# Hourly Rented Bike Count Across Functional Day
+bike %>%
+  ggplot(aes(y = rent, color = func)) +
+  geom_boxplot() +
+  labs(
+    title = "Hourly Rented Bike Count Across Functional Day",
+    y = "Hourly Rented Bike Count")
+```
+
+## Modeling
+
+LM
+
+```{r modeling}
+# Resampling Method - 10-Fold CV
+ctrl1 = trainControl(method = "cv", number = 10)
+
+set.seed(2)
+lm.fit = train(train_x, train_y,
+               method = "lm",
+               trControl = ctrl1)
+summary(lm.fit)
+
+# test error
+lm.pred = predict(lm.fit, newdata = test_x)
+RMSE(lm.pred, test_y)
+# 396.6971
+```
+
+LASSO
+
+```{r}
+set.seed(2)
+lasso.fit = train(train_x, train_y, 
+                  method = "glmnet",
+                  tuneGrid = expand.grid(alpha = 1,
+                                         lambda = exp(seq(5, 0, length = 100))),
+                  trControl = ctrl1) 
+plot(lasso.fit, xTrans = log, main = "Tuning Process of LASSO")
+
+lasso.fit$bestTune
+# lambda = 2.359821
+
+coef(lasso.fit$finalModel, lasso.fit$bestTune$lambda)
+
+# test error
+lasso.pred = predict(lasso.fit, newdata = test_x)
+RMSE(lasso.pred, test_y)
+# 396.3537
+```
+
+PLS
+
+```{r}
+set.seed(2)
+pls.fit = train(train_x, train_y, method = "pls",
+                tuneGrid = data.frame(ncomp = 1:20), 
+                trControl = ctrl1,
+                preProcess = c("center", "scale"))
+ggplot(pls.fit, highlight = TRUE) +
+  labs(title = "Tuning Process of PLS")
+
+pls.fit$bestTune
+# ncomp = 10
+
+summary(pls.fit$finalModel)
+# 57.46% of variance explained
+
+# test error
+pls.pred = predict(pls.fit, newdata = test_x, ncomp = ncomp.cv)
+RMSE(pls.pred, test_y)
+# 395.9891
+```
+
+MARS
+
+```{r}
+set.seed(2)
+mars_grid = expand.grid(degree = 1:6, nprune = 2:30)
+mars.fit = train(train_x, train_y, method = "earth",
+                 tuneGrid = mars_grid,
+                 trControl = ctrl1)
+ggplot(mars.fit) +
+  labs(title = "Tuning Process of MARS")
+
+mars.fit$bestTune
+# nprune = 26; degree = 5
+
+coef(mars.fit$finalModel)
+
+# Variable Importance Plot
+vip(mars.fit$finalModel)
+
+# test error
+mars.pred = predict(mars.fit, newdata = test_x)
+RMSE(mars.pred, test_y)
+# 306.2679
+```
+
+Regression Tree
+
+```{r}
+set.seed(2)
+rpart.fit = train(rent ~.,
+                  trainData,
+                  method = "rpart",
+                  tuneGrid = data.frame(cp = exp(seq(-10, -5, length = 50))),
+                  trControl = ctrl1)
+ggplot(rpart.fit, highlight = TRUE)
+
+rpart.fit$bestTune
+# cp = 0.002689588
+
+# Rpart Plot
+rpart.plot(rpart.fit$finalModel)
+
+# test error
+RMSE(predict(rpart.fit, newdata = testData), test_y)
+# 412.142
+```
+
+GBM
+
+```{r}
+set.seed(2)
+gbm.grid = expand.grid(n.trees = 300:600,
+                        interaction.depth = 10:15,
+                        shrinkage = c(0.01, 0.05, 0.1),
+                        n.minobsinnode = 1)
+gbm.fit = train(rent ~.,
+                trainData,
+                method = "gbm",
+                tuneGrid = gbm.grid,
+                trControl = ctrl1,
+                verbose = FALSE)
+ggplot(gbm.fit, highlight = TRUE) +
+  labs(title = "Tuning Process of GBM")
+
+gbm.fit$bestTune
+# n.trees = 584; interaction.depth = 14; shrinkage = 0.05
+
+# Variable Importance
+summary(gbm.fit$finalModel, las = 2, cBars = 19, cex.names = 0.6)
+
+# test error
+gbm.pred = predict(gbm.fit, newdata = testData)
+RMSE(gbm.pred, test_y)
+# 235.5603
+```
+
+## Chosing Model - GBM
+
+```{r resampling}
+resamp = resamples(list(
+  lm = lm.fit,
+  lasso = lasso.fit,
+  pls = pls.fit,
+  mars = mars.fit,
+  gbm = gbm.fit))
+
+summary(resamp)
+
+bwplot(resamp, metric = "RMSE")
+```
+
+Since the final model is GBM, which is a black-box model...
+
+## Black-Box
+
+Partial Dependence Plots
+
+```{r}
+pdp1.gbm = gbm.fit %>%
+  partial(pred.var = c("hour")) %>%
+  autoplot(train = trainData, rug = TRUE)
+
+pdp2.gbm = gbm.fit %>%
+  partial(pred.var = c("temp")) %>%
+  autoplot(train = trainData, rug = TRUE)
+
+pdp3.gbm = gbm.fit %>%
+  partial(pred.var = c("hour","rain"), chull = TRUE) %>%
+  autoplot(train = trainData, rug = TRUE)
+
+pdp4.gbm = gbm.fit %>%
+  partial(pred.var = c("temp","hum"), chull = TRUE) %>%
+  autoplot(train = trainData, rug = TRUE)
+
+grid.arrange(pdp1.gbm, pdp2.gbm, pdp3.gbm, pdp4.gbm, ncol = 2, nrow = 2)
+```
+
+ICE curves
+
+```{r}
+ice1.gbm <- gbm.fit %>%
+  partial(pred.var = "hour",
+          grid.resolution = 100,
+          ice = TRUE) %>%
+  autoplot(train = bike, alpha = .1, 
+           center = TRUE) +
+  ggtitle("ICE - Hour, centered")
+
+ice2.gbm <- gbm.fit %>%
+  partial(pred.var = "temp",
+          grid.resolution = 100,
+          ice = TRUE) %>%
+  autoplot(train = bike, alpha = .1,
+           center = TRUE) +
+  ggtitle("ICE - Temperature, centered")
+
+grid.arrange(ice1.gbm, ice2.gbm, nrow = 1)
+```
+
